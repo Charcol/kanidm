@@ -2,6 +2,7 @@ macro_rules! setup_test {
     (
         $au:expr
     ) => {{
+        use crate::be::BackendConfig;
         use crate::utils::duration_from_epoch_now;
         use env_logger;
 
@@ -18,7 +19,9 @@ macro_rules! setup_test {
             let schema_txn = schema_outer.write_blocking();
             schema_txn.reload_idxmeta()
         };
-        let be = Backend::new($au, "", 1, FsType::Generic, idxmeta, false).expect("Failed to init BE");
+
+        let be_cfg = BackendConfig::new_in_memory(idxmeta);
+        let be = Backend::new($au, be_cfg).expect("Failed to init BE");
 
         let qs = QueryServer::new(be, schema_outer);
         qs.initialise_helper($au, duration_from_epoch_now())
@@ -29,6 +32,7 @@ macro_rules! setup_test {
         $au:expr,
         $preload_entries:expr
     ) => {{
+        use crate::be::BackendConfig;
         use crate::utils::duration_from_epoch_now;
         use async_std::task;
         use env_logger;
@@ -46,7 +50,8 @@ macro_rules! setup_test {
             let schema_txn = schema_outer.write_blocking();
             schema_txn.reload_idxmeta()
         };
-        let be = Backend::new($au, "", 1, FsType::Generic, idxmeta, false).expect("Failed to init BE");
+        let be_cfg = BackendConfig::new_in_memory(idxmeta);
+        let be = Backend::new($au, be_cfg).expect("Failed to init BE");
 
         let qs = QueryServer::new(be, schema_outer);
         qs.initialise_helper($au, duration_from_epoch_now())
@@ -67,7 +72,8 @@ macro_rules! setup_test {
 macro_rules! run_test_no_init {
     ($test_fn:expr) => {{
         use crate::audit::AuditScope;
-        use crate::be::{Backend, FsType};
+        use crate::be::Backend;
+        use crate::be::BackendConfig;
         use crate::schema::Schema;
         use crate::server::QueryServer;
         use crate::utils::duration_from_epoch_now;
@@ -87,14 +93,9 @@ macro_rules! run_test_no_init {
             let schema_txn = schema_outer.write_blocking();
             schema_txn.reload_idxmeta()
         };
-        let be = match Backend::new(&mut audit, "", 1, FsType::Generic, idxmeta, false) {
-            Ok(be) => be,
-            Err(e) => {
-                audit.write_log();
-                error!("{:?}", e);
-                panic!()
-            }
-        };
+        let be_cfg = BackendConfig::new_in_memory(idxmeta);
+        let be = Backend::new(&mut audit, be_cfg).expect("Failed to init BE");
+
         let test_server = QueryServer::new(be, schema_outer);
 
         $test_fn(&test_server, &mut audit);
@@ -111,7 +112,7 @@ macro_rules! run_test_no_init {
 macro_rules! run_test {
     ($test_fn:expr) => {{
         use crate::audit::AuditScope;
-        use crate::be::{Backend, FsType};
+        use crate::be::Backend;
         use crate::schema::Schema;
         use crate::server::QueryServer;
         #[allow(unused_imports)]
@@ -165,7 +166,7 @@ macro_rules! run_idm_test_inner {
     ($test_fn:expr) => {{
         use crate::audit::AuditScope;
         #[allow(unused_imports)]
-        use crate::be::{Backend, FsType};
+        use crate::be::Backend;
         #[allow(unused_imports)]
         use crate::idm::server::{IdmServer, IdmServerDelayed};
         #[allow(unused_imports)]
@@ -240,7 +241,7 @@ macro_rules! run_create_test {
         $check:expr
     ) => {{
         use crate::audit::AuditScope;
-        use crate::be::{Backend, FsType};
+        use crate::be::Backend;
         use crate::event::CreateEvent;
         use crate::schema::Schema;
         use crate::server::QueryServer;
@@ -295,7 +296,7 @@ macro_rules! run_modify_test {
         $check:expr
     ) => {{
         use crate::audit::AuditScope;
-        use crate::be::{Backend, FsType};
+        use crate::be::Backend;
         use crate::event::ModifyEvent;
         use crate::schema::Schema;
         use crate::server::QueryServer;
@@ -357,7 +358,7 @@ macro_rules! run_delete_test {
         $check:expr
     ) => {{
         use crate::audit::AuditScope;
-        use crate::be::{Backend, FsType};
+        use crate::be::Backend;
         use crate::event::DeleteEvent;
         use crate::schema::Schema;
         use crate::server::QueryServer;

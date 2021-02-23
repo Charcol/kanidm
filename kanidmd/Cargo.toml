@@ -90,8 +90,12 @@ users = "0.11"
 
 smartstring = { version = "0.2", features = ["serde"] }
 
+xlsxwriter = { version = "0.3", optional = true }
+
 [features]
 simd_support = [ "concread/simd_support" ]
+xlsx = ["xlsxwriter"]
+
 # default = [ "libsqlite3-sys/bundled", "openssl/vendored" ]
 
 [dev-dependencies]

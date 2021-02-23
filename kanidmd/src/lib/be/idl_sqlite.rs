@@ -1,5 +1,5 @@
 use crate::audit::AuditScope;
-use crate::be::{IdRawEntry, IDL};
+use crate::be::{FsType, IdRawEntry, IDL};
 use crate::entry::{Entry, EntryCommitted, EntrySealed};
 use crate::value::{IndexType, Value};
 use idlset::IDLBitRange;
@@ -14,16 +14,35 @@ use std::convert::{TryFrom, TryInto};
 use std::time::Duration;
 use uuid::Uuid;
 
-// use uuid::Uuid;
-
 const DBV_ID2ENTRY: &str = "id2entry";
 const DBV_INDEXV: &str = "indexv";
 
-#[repr(u32)]
-#[derive(Debug, Copy, Clone)]
-pub enum FsType {
-    Generic = 4096,
-    ZFS = 65536,
+#[derive(Debug, Clone)]
+pub struct IdlSqliteConfig {
+    pub path: String,
+    pub pool_size: u32,
+    pub fstype: FsType,
+    pub vacuum: bool,
+}
+
+impl IdlSqliteConfig {
+    pub fn new_in_memory() -> Self {
+        IdlSqliteConfig {
+            path: "".to_string(),
+            pool_size: 1,
+            fstype: FsType::Generic,
+            vacuum: false,
+        }
+    }
+
+    pub fn new(path: &str, pool_size: u32, fstype: FsType, vacuum: bool) -> Self {
+        IdlSqliteConfig {
+            path: path.to_string(),
+            pool_size,
+            fstype,
+            vacuum,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1233,16 +1252,19 @@ impl IdlSqliteWriteTransaction {
 }
 
 impl IdlSqlite {
-    pub fn new(
-        audit: &mut AuditScope,
-        path: &str,
-        pool_size: u32,
-        fstype: FsType,
-        vacuum: bool,
-    ) -> Result<Self, OperationError> {
+    pub fn new(audit: &mut AuditScope, config: IdlSqliteConfig) -> Result<Self, OperationError> {
+        let IdlSqliteConfig {
+            path,
+            mut pool_size,
+            fstype,
+            vacuum,
+        } = config;
+
+        // If in memory, reduce pool to 1
         if path == "" {
-            debug_assert!(pool_size == 1);
+            pool_size = 1;
         }
+
         // If provided, set the page size to match the tuning we want. By default we use 4096. The VACUUM
         // immediately after is so that on db create the page size takes effect.
         //
@@ -1258,7 +1280,7 @@ impl IdlSqlite {
                 "NOTICE: A db vacuum has been requested. This may take a long time ...\n"
             );
 
-            let vconn = Connection::open_with_flags(path, flags).map_err(|e| {
+            let vconn = Connection::open_with_flags(&path, flags).map_err(|e| {
                 ladmin_error!(audit, "rusqlite error {:?}", e);
                 OperationError::SQLiteError
             })?;
@@ -1275,7 +1297,7 @@ impl IdlSqlite {
                 OperationError::SQLiteError
             })?;
 
-            let vconn = Connection::open_with_flags(path, flags).map_err(|e| {
+            let vconn = Connection::open_with_flags(&path, flags).map_err(|e| {
                 ladmin_error!(audit, "rusqlite error {:?}", e);
                 OperationError::SQLiteError
             })?;
@@ -1307,7 +1329,7 @@ impl IdlSqlite {
             limmediate_warning!(audit, "NOTICE: db vacuum complete\n");
         };
 
-        let manager = SqliteConnectionManager::file(path)
+        let manager = SqliteConnectionManager::file(&path)
             .with_init(move |c| {
                 c.execute_batch(
                     format!(
@@ -1350,17 +1372,22 @@ impl IdlSqlite {
             .expect("Unable to get connection from pool!!!");
         IdlSqliteWriteTransaction::new(conn)
     }
+
+    pub fn get_pool_size(&self) -> usize {
+        self.pool.max_size() as usize
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::audit::AuditScope;
-    use crate::be::idl_sqlite::{FsType, IdlSqlite, IdlSqliteTransaction};
+    use crate::be::idl_sqlite::{IdlSqlite, IdlSqliteConfig, IdlSqliteTransaction};
 
     #[test]
     fn test_idl_sqlite_verify() {
         let mut audit = AuditScope::new("run_test", uuid::Uuid::new_v4(), None);
-        let be = IdlSqlite::new(&mut audit, "", 1, FsType::Generic, false).unwrap();
+        let be_cfg = IdlSqliteConfig::new_in_memory();
+        let be = IdlSqlite::new(&mut audit, be_cfg).unwrap();
         let be_w = be.write();
         let r = be_w.verify();
         assert!(r.len() == 0);

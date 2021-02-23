@@ -22,22 +22,76 @@ use uuid::Uuid;
 
 pub mod dbentry;
 pub mod dbvalue;
-mod idl_arc_sqlite;
+mod idl_arc;
+
+#[cfg(not(feature = "xlsx"))]
 mod idl_sqlite;
+#[cfg(feature = "xlsx")]
+mod idl_xlsx;
+
 pub(crate) mod idxkey;
 
 pub(crate) use self::idxkey::{IdxKey, IdxKeyRef, IdxKeyToRef};
 
-use crate::be::idl_arc_sqlite::{
-    IdlArcSqlite, IdlArcSqliteReadTransaction, IdlArcSqliteTransaction,
-    IdlArcSqliteWriteTransaction,
+use crate::be::idl_arc::{
+    IdlArc, IdlArcConfig, IdlArcReadTransaction, IdlArcTransaction, IdlArcWriteTransaction,
 };
 
-// Re-export this
-pub use crate::be::idl_sqlite::FsType;
+#[cfg(not(feature = "xlsx"))]
+use crate::be::idl_sqlite::IdlSqliteConfig;
+
+#[cfg(feature = "xlsx")]
+use crate::be::idl_xlsx::IdlXlsxConfig;
 
 const FILTER_SEARCH_TEST_THRESHOLD: usize = 8;
 const FILTER_EXISTS_TEST_THRESHOLD: usize = 0;
+
+#[repr(u32)]
+#[derive(Debug, Copy, Clone)]
+pub enum FsType {
+    Generic = 4096,
+    ZFS = 65536,
+}
+
+#[derive(Debug, Clone)]
+pub struct BackendConfig {
+    idxmeta: Set<IdxKey>,
+    config: IdlArcConfig,
+}
+
+impl BackendConfig {
+    pub fn new_in_memory(idxmeta: Set<IdxKey>) -> Self {
+        BackendConfig {
+            idxmeta,
+            config: IdlArcConfig {
+                cache_target: None,
+                #[cfg(not(feature = "xlsx"))]
+                lower_config: IdlSqliteConfig::new_in_memory(),
+                #[cfg(feature = "xlsx")]
+                lower_config: IdlXlsxConfig::new_temporary(),
+            },
+        }
+    }
+
+    pub fn new(
+        path: &str,
+        pool_size: u32,
+        fstype: FsType,
+        idxmeta: Set<IdxKey>,
+        vacuum: bool,
+    ) -> Self {
+        BackendConfig {
+            idxmeta,
+            config: IdlArcConfig {
+                cache_target: None,
+                #[cfg(not(feature = "xlsx"))]
+                lower_config: IdlSqliteConfig::new(path, pool_size, fstype, vacuum),
+                #[cfg(feature = "xlsx")]
+                lower_config: IdlXlsxConfig::new(path),
+            },
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum IDL {
@@ -55,8 +109,7 @@ pub struct IdRawEntry {
 
 #[derive(Clone)]
 pub struct Backend {
-    pool_size: usize,
-    idlayer: Arc<IdlArcSqlite>,
+    idlayer: Arc<IdlArc>,
     /// This is a copy-on-write cache of the index metadata that has been
     /// extracted from attributes set, in the correct format for the backend
     /// to consume.
@@ -64,12 +117,12 @@ pub struct Backend {
 }
 
 pub struct BackendReadTransaction<'a> {
-    idlayer: UnsafeCell<IdlArcSqliteReadTransaction<'a>>,
+    idlayer: UnsafeCell<IdlArcReadTransaction<'a>>,
     idxmeta: CowCellReadTxn<Set<IdxKey>>,
 }
 
 pub struct BackendWriteTransaction<'a> {
-    idlayer: UnsafeCell<IdlArcSqliteWriteTransaction<'a>>,
+    idlayer: UnsafeCell<IdlArcWriteTransaction<'a>>,
     idxmeta: CowCellReadTxn<Set<IdxKey>>,
     idxmeta_wr: CowCellWriteTxn<'a, Set<IdxKey>>,
 }
@@ -87,7 +140,7 @@ impl IdRawEntry {
 }
 
 pub trait BackendTransaction {
-    type IdlLayerType: IdlArcSqliteTransaction;
+    type IdlLayerType: IdlArcTransaction;
 
     #[allow(clippy::mut_from_ref)]
     fn get_idlayer(&self) -> &mut Self::IdlLayerType;
@@ -687,10 +740,10 @@ pub trait BackendTransaction {
 }
 
 impl<'a> BackendTransaction for BackendReadTransaction<'a> {
-    type IdlLayerType = IdlArcSqliteReadTransaction<'a>;
+    type IdlLayerType = IdlArcReadTransaction<'a>;
 
     #[allow(clippy::mut_from_ref)]
-    fn get_idlayer(&self) -> &mut IdlArcSqliteReadTransaction<'a> {
+    fn get_idlayer(&self) -> &mut IdlArcReadTransaction<'a> {
         // OKAY here be the cursed bullshit. We know that in our application
         // that during a transaction, that we are the only holder of the
         // idlayer, so we KNOW it can be mut, and we know every thing it
@@ -711,10 +764,10 @@ impl<'a> BackendTransaction for BackendReadTransaction<'a> {
 }
 
 impl<'a> BackendTransaction for BackendWriteTransaction<'a> {
-    type IdlLayerType = IdlArcSqliteWriteTransaction<'a>;
+    type IdlLayerType = IdlArcWriteTransaction<'a>;
 
     #[allow(clippy::mut_from_ref)]
-    fn get_idlayer(&self) -> &mut IdlArcSqliteWriteTransaction<'a> {
+    fn get_idlayer(&self) -> &mut IdlArcWriteTransaction<'a> {
         unsafe { &mut (*self.idlayer.get()) }
     }
 
@@ -1306,24 +1359,12 @@ impl<'a> BackendWriteTransaction<'a> {
 
 // In the future this will do the routing between the chosen backends etc.
 impl Backend {
-    pub fn new(
-        audit: &mut AuditScope,
-        path: &str,
-        mut pool_size: u32,
-        fstype: FsType,
-        idxmeta: Set<IdxKey>,
-        vacuum: bool,
-    ) -> Result<Self, OperationError> {
-        // If in memory, reduce pool to 1
-        if path == "" {
-            pool_size = 1;
-        }
-
-        // this has a ::memory() type, but will path == "" work?
+    pub fn new(audit: &mut AuditScope, be_config: BackendConfig) -> Result<Self, OperationError> {
         lperf_trace_segment!(audit, "be::new", || {
+            let BackendConfig { idxmeta, config } = be_config;
+
             let be = Backend {
-                pool_size: pool_size as usize,
-                idlayer: Arc::new(IdlArcSqlite::new(audit, path, pool_size, fstype, vacuum)?),
+                idlayer: Arc::new(IdlArc::new(audit, config)?),
                 idxmeta: Arc::new(CowCell::new(idxmeta)),
             };
 
@@ -1346,8 +1387,7 @@ impl Backend {
     }
 
     pub fn get_pool_size(&self) -> usize {
-        debug_assert!(self.pool_size > 0);
-        self.pool_size
+        self.idlayer.get_pool_size()
     }
 
     pub fn read(&self) -> BackendReadTransaction {
@@ -1400,7 +1440,7 @@ mod tests {
     use super::super::entry::{Entry, EntryInit, EntryNew};
     use super::IdxKey;
     use super::{
-        Backend, BackendTransaction, BackendWriteTransaction, FsType, OperationError, IDL,
+        Backend, BackendConfig, BackendTransaction, BackendWriteTransaction, OperationError, IDL,
     };
     use crate::event::EventLimits;
     use crate::value::{IndexType, PartialValue, Value};
@@ -1449,8 +1489,8 @@ mod tests {
                 itype: IndexType::EQUALITY,
             });
 
-            let be = Backend::new(&mut audit, "", 1, FsType::Generic, idxmeta, false)
-                .expect("Failed to setup backend");
+            let be_cfg = BackendConfig::new_in_memory(idxmeta);
+            let be = Backend::new(&mut audit, be_cfg).expect("Failed to setup backend");
 
             let mut be_txn = be.write();
 
